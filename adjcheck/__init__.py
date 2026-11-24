@@ -1,7 +1,3 @@
-"""Adjacency (接幅) checker package.
+"""正射图幅配准核查（orthophoto sheet registration checker）。"""
 
-``create_app`` lives in :mod:`adjcheck.app`; it is not imported here so that
-geometry/service unit tests do not boot a Flask app (or seed a database).
-"""
-
-__version__ = "1.0.0"
+__version__ = "2.0.0"

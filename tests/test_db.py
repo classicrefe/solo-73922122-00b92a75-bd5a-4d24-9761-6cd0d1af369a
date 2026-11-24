@@ -5,9 +5,10 @@ import sqlite3
 import pytest
 
 from adjcheck import service
-from adjcheck.db import Database, StorageError
-from adjcheck.geometry import Rect
-from adjcheck.models import BatchEntry, Stats
+from adjcheck.db import Database
+from adjcheck.errors import StorageError
+from adjcheck.geometry import Point, Rect
+from adjcheck.models import Measurement
 
 
 @pytest.fixture()
@@ -17,142 +18,111 @@ def db(tmp_path):
     return database
 
 
-def test_schema_rejects_malformed_issue_rows(db):
-    service.create_project(
-        db, "P", Rect(0, 0, 10, 10), [BatchEntry("A", Rect(0, 0, 10, 10))]
-    )
-    with db.connection() as conn:
-        project_id = conn.execute("SELECT id FROM projects").fetchone()[0]
-        # overlap needs at least two sheet numbers
-        with pytest.raises(sqlite3.IntegrityError):
-            conn.execute(
-                "INSERT INTO issues (project_id, kind, x0, y0, x1, y1, sheet_ids) "
-                "VALUES (?, 'overlap', 0, 0, 1, 1, '[\"A\"]')",
-                (project_id,),
-            )
-        # missing must carry no sheet numbers
-        with pytest.raises(sqlite3.IntegrityError):
-            conn.execute(
-                "INSERT INTO issues (project_id, kind, x0, y0, x1, y1, sheet_ids) "
-                "VALUES (?, 'missing', 0, 0, 1, 1, '[\"A\",\"B\"]')",
-                (project_id,),
-            )
-        # unknown kinds and zero-area rectangles are rejected too
-        with pytest.raises(sqlite3.IntegrityError):
-            conn.execute(
-                "INSERT INTO issues (project_id, kind, x0, y0, x1, y1, sheet_ids) "
-                "VALUES (?, 'weird', 0, 0, 1, 1, '[]')",
-                (project_id,),
-            )
-        with pytest.raises(sqlite3.IntegrityError):
-            conn.execute(
-                "INSERT INTO issues (project_id, kind, x0, y0, x1, y1, sheet_ids) "
-                "VALUES (?, 'missing', 1, 1, 1, 2, '[]')",
-                (project_id,),
-            )
-        conn.execute("DELETE FROM issues")
+def make(db: Database, name: str = "P") -> None:
+    assert service.create_project(db, name, "树", [("A", Rect(0, 0, 10, 10)), ("B", Rect(0, 0, 10, 10))])
 
 
-def test_sheet_numbers_are_unique_per_project(db):
-    service.create_project(
-        db, "P", Rect(0, 0, 10, 10), [BatchEntry("A", Rect(0, 0, 5, 5))]
-    )
+def test_measurement_number_is_unique_per_project(db):
+    make(db)
+    service.add_measurement(db, "P", Measurement("M1", "A", Point(1, 1), "B", Point(1, 1)))
+    with pytest.raises(service.ValidationError):
+        service.add_measurement(db, "P", Measurement("M1", "A", Point(2, 2), "B", Point(2, 2)))
+
+
+def test_measurement_limit_is_120(db):
+    make(db)
+    for index in range(120):
+        service.add_measurement(
+            db, "P", Measurement(f"M{index}", "A", Point(1, 1), "B", Point(1, 1))
+        )
+    with pytest.raises(service.ValidationError):
+        service.add_measurement(db, "P", Measurement("M120", "A", Point(1, 1), "B", Point(1, 1)))
+    # the database enforces the same limit even if the service check is bypassed
+    with pytest.raises(StorageError):
+        db.add_measurement("P", Measurement("M120", "A", Point(1, 1), "B", Point(1, 1)))
+
+
+def test_schema_rejects_same_sheet_on_both_sides(db):
+    make(db)
     with db.connection() as conn:
         project_id = conn.execute("SELECT id FROM projects").fetchone()[0]
         with pytest.raises(sqlite3.IntegrityError):
             conn.execute(
-                "INSERT INTO sheets (project_id, no, x0, y0, x1, y1, position) "
-                "VALUES (?, 'A', 5, 5, 10, 10, 9)",
+                "INSERT INTO measurements (project_id, no, sheet_a, ax, ay, sheet_b, bx, by, created_at) "
+                "VALUES (?, 'M1', 'A', 1, 1, 'A', 1, 1, 'now')",
                 (project_id,),
             )
 
 
-def test_delete_project_cascades(db):
-    service.create_project(
-        db, "P", Rect(0, 0, 10, 10),
-        [BatchEntry("A", Rect(0, 0, 4, 4)), BatchEntry("B", Rect(6, 0, 10, 4))],
-    )
-    assert db.get_issues("P")
+def test_correction_keeps_measurements_and_bumps_version(db):
+    make(db)
+    service.add_measurement(db, "P", Measurement("M1", "A", Point(1, 1), "B", Point(9, 9)))
+    project = db.get_project("P")
+    ok, message = service.apply_correction(db, "P", [("B", Rect(0, 0, 5, 5))], project.version)
+    assert ok, message
+    snapshot = db.get_snapshot("P")
+    assert snapshot.project.version == 1
+    assert snapshot.sheet_map["B"].rect == Rect(0, 0, 5, 5)
+    # original coordinates are preserved verbatim
+    measurement = snapshot.measurements[0]
+    assert (measurement.point_a.x, measurement.point_a.y) == (1, 1)
+    assert (measurement.point_b.x, measurement.point_b.y) == (9, 9)
+    # the measurement is now invalid, because 9 is outside B's new 0..5 range
+    validity = service.valid_edges(snapshot)[1]
+    assert validity[0].valid is False
+
+
+def test_stale_version_is_rejected_without_writes(db):
+    make(db)
+    ok, message = service.apply_correction(db, "P", [("B", Rect(0, 0, 5, 5))], 7)
+    assert not ok
+    assert "已过期" in message
+    assert db.get_project("P").version == 0
+    assert db.get_snapshot("P").sheet_map["B"].rect == Rect(0, 0, 10, 10)
+
+
+def test_correction_can_add_a_sheet_and_logs_it(db):
+    make(db)
+    project = db.get_project("P")
+    ok, _ = service.apply_correction(db, "P", [("C", Rect(20, 0, 30, 10))], project.version)
+    assert ok
+    snapshot = db.get_snapshot("P")
+    assert [s.no for s in snapshot.sheets] == ["A", "B", "C"]
+    log = db.get_log("P")
+    assert log[0]["status"] == "applied"
+    assert [item["no"] for item in log[0]["batch"]] == ["C"]
+
+
+def test_original_coordinates_survive_close_and_reopen(db):
+    make(db)
+    service.add_measurement(db, "P", Measurement("M1", "A", Point(3, 4), "B", Point(5, 6)))
+    reopened = Database(db.path)
+    measurement = reopened.get_snapshot("P").measurements[0]
+    assert measurement.point_a == Point(3, 4)
+    assert measurement.point_b == Point(5, 6)
+
+
+def test_delete_cascades_sheets_and_measurements(db):
+    make(db)
+    service.add_measurement(db, "P", Measurement("M1", "A", Point(1, 1), "B", Point(1, 1)))
     assert db.delete_project("P")
     with db.connection() as conn:
-        assert conn.execute("SELECT COUNT(*) FROM issues").fetchone()[0] == 0
         assert conn.execute("SELECT COUNT(*) FROM sheets").fetchone()[0] == 0
+        assert conn.execute("SELECT COUNT(*) FROM measurements").fetchone()[0] == 0
+        assert conn.execute("SELECT COUNT(*) FROM correction_log").fetchone()[0] == 0
 
 
-def test_concurrent_issue_modification_aborts_merge(db):
-    """If the stored result changes between read and write, nothing is merged."""
+def test_snapshot_is_consistent_while_a_correction_is_applied(db):
+    """A verification that holds a snapshot is unaffected by a concurrent correction."""
 
-    service.create_project(
-        db, "P", Rect(0, 0, 100, 100),
-        [BatchEntry("A", Rect(0, 0, 40, 100)), BatchEntry("B", Rect(60, 0, 100, 100))],
-    )
-    project, sheets, issues = db.get_state("P")
-    plan = service.build_plan(
-        project,
-        sheets,
-        issues,
-        [BatchEntry("B", Rect(40, 0, 100, 100))],
-        expected_version=0,
-    )
-    assert plan.accepted, plan.reasons
-    # simulate an external writer inserting an extra issue row
-    with db.connection() as conn:
-        project_id = conn.execute("SELECT id FROM projects").fetchone()[0]
-        conn.execute(
-            "INSERT INTO issues (project_id, kind, x0, y0, x1, y1, sheet_ids) "
-            "VALUES (?, 'missing', 0, 90, 100, 100, '[]')",
-            (project_id,),
-        )
-    with pytest.raises(StorageError):
-        db.apply_correction("P", 0, plan)
-    project, sheets, issues = db.get_state("P")
-    assert project.version == 0
-    assert any(i.rect.as_tuple() == (0, 90, 100, 100) for i in issues)
-
-
-def test_issue_rows_outside_window_are_reused(db):
-    # bottom band: gap at x=40..60; top band: overlap at x=50..100
-    service.create_project(
-        db, "P", Rect(0, 0, 200, 200),
-        [
-            BatchEntry("A", Rect(0, 0, 40, 100)),
-            BatchEntry("B", Rect(60, 0, 200, 100)),
-            BatchEntry("F1", Rect(0, 150, 100, 200)),
-            BatchEntry("F2", Rect(50, 150, 150, 200)),
-        ],
-    )
-    project, sheets, issues = db.get_state("P")
-    far = [i for i in issues if i.rect.y0 >= 150]
-    assert far
-    plan = service.build_plan(
-        project, sheets, issues, [BatchEntry("B", Rect(40, 0, 200, 100))], expected_version=0
-    )
-    assert plan.accepted, plan.reasons
-    replaced = {i.id for i in plan.split.replaced}
-    assert not (replaced & {i.id for i in far})
-    ok, message = db.apply_correction("P", 0, plan)
-    assert ok, message
-    _, _, after = db.get_state("P")
-    after_ids = {i.id for i in after}
-    assert {i.id for i in far} <= after_ids
-
-
-def test_rejected_attempt_is_logged_with_reason(db):
-    service.create_project(
-        db, "P", Rect(0, 0, 100, 100),
-        [BatchEntry("A", Rect(0, 0, 40, 100)), BatchEntry("B", Rect(60, 0, 100, 100))],
-    )
-    project, sheets, issues = db.get_state("P")
-    plan = service.build_plan(
-        project, sheets, issues, [BatchEntry("A", Rect(0, 0, 70, 100))], expected_version=0
-    )
-    assert not plan.accepted
-    log_id = db.log_rejection("P", 0, plan)
-    assert log_id
-    log = db.get_log("P")
-    assert log[0]["status"] == "rejected"
-    assert "新的重叠位置" in log[0]["reason"]
-    assert log[0]["version_after"] is None
-    project, sheets, issues = db.get_state("P")
-    assert project.version == 0
-    assert Stats.from_issues(issues).missing_area == 2000  # 20 x 100
+    make(db)
+    service.add_measurement(db, "P", Measurement("M1", "A", Point(1, 1), "B", Point(9, 9)))
+    first = db.get_snapshot("P")
+    ok, _ = service.apply_correction(db, "P", [("B", Rect(0, 0, 5, 5))], first.project.version)
+    assert ok
+    # the held snapshot still uses the submitted catalog and measurements
+    before = service.valid_edges(first)[1]
+    assert before[0].valid is True
+    # the next verification re-judges against the corrected catalog
+    after = service.valid_edges(db.get_snapshot("P"))[1]
+    assert after[0].valid is False

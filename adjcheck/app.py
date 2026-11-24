@@ -1,51 +1,95 @@
-"""Flask application factory for the adjacency (接幅) checker."""
+"""Flask 应用：项目目录、测量录入、双路径核查与图幅更正。"""
 
 from __future__ import annotations
 
 import os
-from dataclasses import asdict
 
-from flask import Flask, abort, flash, jsonify, redirect, render_template, request, url_for
+from flask import (
+    Flask,
+    abort,
+    flash,
+    jsonify,
+    redirect,
+    render_template,
+    request,
+    url_for,
+)
 
-from .db import Database, StorageError
-from .geometry import Rect
-from .models import Issue, Stats
 from . import service
+from .db import Database
+from .errors import StorageError, ValidationError
+from .geometry import Rect
+from .models import MeasurementValidity, Snapshot, Verification
 
 
-def _stats_dict(stats: Stats) -> dict:
-    data = asdict(stats)
-    data["problem_area"] = stats.problem_area
-    return data
-
-
-def _issue_dict(issue: Issue, extent: Rect) -> dict:
+def _validity_dict(item: MeasurementValidity) -> dict:
+    measurement = item.measurement
     return {
-        "id": issue.id,
-        "kind": issue.kind,
-        "rect": list(issue.rect.as_tuple()),
-        "area": issue.rect.area,
-        "sheet_ids": list(issue.sheet_ids),
-        "svg": service.svg_rect(issue.rect, extent),
+        "no": measurement.no,
+        "sheet_a": measurement.sheet_a,
+        "point_a": list(measurement.point_a.as_tuple()),
+        "sheet_b": measurement.sheet_b,
+        "point_b": list(measurement.point_b.as_tuple()),
+        "valid": item.valid,
+        "reasons": list(item.reasons),
     }
 
 
-def _plan_dict(plan, extent: Rect) -> dict:
+def _verification_dict(result: Verification) -> dict:
     return {
-        "status": plan.status,
-        "accepted": plan.accepted,
-        "reasons": plan.reasons,
-        "window": [list(r.as_tuple()) for r in plan.window],
-        "window_svg": [service.svg_rect(r, extent) for r in plan.window],
-        "before": _stats_dict(plan.before),
-        "after": _stats_dict(plan.after),
-        "eliminated": _stats_dict(plan.eliminated),
-        "new_problems": _stats_dict(plan.new_problems),
-        "batch": [
-            {"no": e.sheet_no, "rect": list(e.rect.as_tuple())} for e in plan.batch
+        "status": result.status,
+        "status_label": result.status_label,
+        "message": result.message,
+        "reference": result.reference,
+        "target": result.target,
+        "version": result.version,
+        "translation": list(result.translation) if result.translation else None,
+        "translation_x": result.translation_x,
+        "translation_y": result.translation_y,
+        "max_paths": result.max_paths,
+        "conflicts": list(result.conflicts),
+        "measurements": [_validity_dict(item) for item in result.validity],
+        "invalid": [_validity_dict(item) for item in result.invalid_measurements],
+        "paths": [
+            {
+                "measurements": list(path.measurements),
+                "sheets": list(path.sheets),
+                "translation": list(path.translation),
+            }
+            for path in result.paths
         ],
-        "version": plan.expected_version,
     }
+
+
+def _snapshot_dict(snapshot: Snapshot) -> dict:
+    return {
+        "project": {
+            "name": snapshot.project.name,
+            "feature": snapshot.project.feature,
+            "version": snapshot.project.version,
+            "created_at": snapshot.project.created_at,
+            "updated_at": snapshot.project.updated_at,
+        },
+        "sheets": [
+            {"no": sheet.no, "rect": list(sheet.rect.as_tuple())} for sheet in snapshot.sheets
+        ],
+        "measurements": [
+            {
+                "no": item.no,
+                "sheet_a": item.sheet_a,
+                "point_a": list(item.point_a.as_tuple()),
+                "sheet_b": item.sheet_b,
+                "point_b": list(item.point_b.as_tuple()),
+            }
+            for item in snapshot.measurements
+        ],
+    }
+
+
+def _json_error(reasons) -> tuple[dict, int]:
+    if isinstance(reasons, str):
+        reasons = [reasons]
+    return {"error": "；".join(reasons), "reasons": list(reasons)}, 400
 
 
 def create_app(*, database_path: str | None = None, seed_demo: bool = True) -> Flask:
@@ -61,33 +105,28 @@ def create_app(*, database_path: str | None = None, seed_demo: bool = True) -> F
     if seed_demo:
         try:
             service.ensure_demo(db)
-        except Exception:  # demo seeding must not take the site down
+        except Exception:  # 示例数据失败不应阻止站点启动
             app.logger.exception("示例项目初始化失败")
 
     # ------------------------------------------------------------- catalog
 
     @app.get("/")
     def index():
-        catalog = db.list_catalog()
-        return render_template("index.html", catalog=catalog)
+        return render_template("index.html", catalog=db.list_catalog())
 
     @app.post("/projects")
     def create():
         name = (request.form.get("name") or "").strip()
         try:
-            extent = service.parse_extent(
-                request.form.get("x0", ""),
-                request.form.get("y0", ""),
-                request.form.get("x1", ""),
-                request.form.get("y1", ""),
-            )
+            name = service.parse_project_name(name)
+            feature = service.parse_feature(request.form.get("feature", ""))
             entries = service.parse_sheet_lines(
                 request.form.get("sheets", ""),
                 max_entries=service.MAX_SHEETS,
                 context="图幅清单",
             )
-            created = service.create_project(db, name, extent, entries)
-        except service.ValidationError as exc:
+            created = service.create_project(db, name, feature, entries)
+        except ValidationError as exc:
             for reason in exc.reasons:
                 flash(reason, "error")
             return redirect(url_for("index"))
@@ -97,7 +136,7 @@ def create_app(*, database_path: str | None = None, seed_demo: bool = True) -> F
         if not created:
             flash(f"项目 {name!r} 已存在", "error")
             return redirect(url_for("index"))
-        flash(f"项目 {name} 已创建并完成初始核查", "ok")
+        flash(f"项目 {name} 已创建", "ok")
         return redirect(url_for("project_detail", name=name))
 
     @app.post("/projects/<name>/delete")
@@ -110,238 +149,214 @@ def create_app(*, database_path: str | None = None, seed_demo: bool = True) -> F
 
     # -------------------------------------------------------------- detail
 
-    @app.get("/projects/<name>")
-    def project_detail(name: str):
-        state = db.get_state(name)
-        if state is None:
-            abort(404)
-        project, sheets, issues = state
-        missing = [i for i in issues if i.kind == "missing"]
-        overlap = [i for i in issues if i.kind == "overlap"]
-        stats = Stats.from_issues(issues)
-        log = db.get_log(name)
+    def _load(name: str) -> Snapshot | None:
+        return db.get_snapshot(name)
+
+    def _render_project(
+        snapshot: Snapshot,
+        *,
+        reference: str = "",
+        target: str = "",
+        result: Verification | None = None,
+    ):
+        validity = {
+            item.measurement.no: item
+            for item in service.valid_edges(snapshot)[1]
+        }
         return render_template(
             "project.html",
-            project=project,
-            sheets=sheets,
-            issues=issues,
-            missing=missing,
-            overlap=overlap,
-            stats=stats,
-            log=log,
-            svg=service.svg_geometry(project.extent),
-            sheet_boxes=[
-                {"no": s.no, "svg": service.svg_rect(s.rect, project.extent), "rect": s.rect}
-                for s in sheets
-            ],
-            issue_boxes=[
-                {"kind": i.kind, "sheet_ids": i.sheet_ids, "svg": service.svg_rect(i.rect, project.extent)}
-                for i in issues
-            ],
-            demo_batch=(service.DEMO_BATCH_TEXT if name == service.DEMO_NAME else ""),
-            demo_reject=(service.DEMO_REJECT_TEXT if name == service.DEMO_NAME else ""),
-            demo_notes=(service.DEMO_NOTES if name == service.DEMO_NAME else []),
+            project=snapshot.project,
+            sheets=list(snapshot.sheets),
+            measurements=list(snapshot.measurements),
+            validity=validity,
+            reference=reference,
+            target=target,
+            result=result,
+            log=db.get_log(snapshot.project.name),
+            demo_notes=(
+                service.DEMO_NOTES if snapshot.project.name == service.DEMO_NAME else []
+            ),
+            demo_correction=(
+                service.DEMO_CORRECTION_TEXT
+                if snapshot.project.name == service.DEMO_NAME
+                else ""
+            ),
         )
 
-    # ----------------------------------------------------------- check/apply
-
-    def _load(name: str):
-        state = db.get_state(name)
-        if state is None:
-            return None
-        return state
-
-    def _plan_from_request(project, sheets, issues, payload):
-        batch = service.parse_batch_json(payload.get("batch"))
-        expected = payload.get("version")
-        try:
-            expected_version = int(expected) if expected not in (None, "") else None
-        except (TypeError, ValueError):
-            raise service.ValidationError(["version 必须是整数"])
-        return service.build_plan(
-            project, sheets, issues, batch, expected_version=expected_version
-        )
-
-    @app.post("/api/projects/<name>/check")
-    def api_check(name: str):
-        state = _load(name)
-        if state is None:
-            return jsonify({"error": "项目不存在"}), 404
-        project, sheets, issues = state
-        payload = request.get_json(silent=True) or {}
-        try:
-            plan = _plan_from_request(project, sheets, issues, payload)
-        except service.ValidationError as exc:
-            return jsonify({"error": "；".join(exc.reasons), "reasons": exc.reasons}), 400
-        return jsonify(_plan_dict(plan, project.extent))
-
-    @app.post("/api/projects/<name>/apply")
-    def api_apply(name: str):
-        state = _load(name)
-        if state is None:
-            return jsonify({"error": "项目不存在"}), 404
-        project, sheets, issues = state
-        payload = request.get_json(silent=True) or {}
-        try:
-            plan = _plan_from_request(project, sheets, issues, payload)
-        except service.ValidationError as exc:
-            return jsonify({"error": "；".join(exc.reasons), "reasons": exc.reasons}), 400
-
-        if plan.status == "stale":
-            return (
-                jsonify(
-                    {
-                        "applied": False,
-                        "message": "页面数据已过期，未做任何修改，请刷新后重试",
-                        "reasons": plan.reasons,
-                        "plan": _plan_dict(plan, project.extent),
-                    }
-                ),
-                409,
-            )
-
-        if not plan.accepted:
-            log_id = db.log_rejection(
-                name,
-                plan.expected_version if plan.expected_version is not None else project.version,
-                plan,
-            )
-            return (
-                jsonify(
-                    {
-                        "applied": False,
-                        "message": "更正被退回，目录与核查结果保持原状",
-                        "log_id": log_id,
-                        "plan": _plan_dict(plan, project.extent),
-                    }
-                ),
-                200,
-            )
-
-        try:
-            ok, message = service.commit_plan(db, name, plan)
-        except StorageError as exc:
-            return (
-                jsonify(
-                    {
-                        "applied": False,
-                        "message": f"写入失败，已回滚并保留原状：{exc}",
-                        "plan": _plan_dict(plan, project.extent),
-                    }
-                ),
-                500,
-            )
-        if not ok:
-            return (
-                jsonify(
-                    {
-                        "applied": False,
-                        "message": message,
-                        "plan": _plan_dict(plan, project.extent),
-                    }
-                ),
-                409,
-            )
-        return jsonify(
-            {
-                "applied": True,
-                "message": message,
-                "plan": _plan_dict(plan, project.extent),
-                "state_url": url_for("project_detail", name=name),
-            }
-        )
-
-    # server-side fallback used by the detail page when JS is unavailable
-    @app.post("/projects/<name>/correct")
-    def correct_form(name: str):
-        state = _load(name)
-        if state is None:
+    @app.get("/projects/<name>")
+    def project_detail(name: str):
+        snapshot = _load(name)
+        if snapshot is None:
             abort(404)
-        project, sheets, issues = state
-        action = request.form.get("action", "check")
-        batch_text = request.form.get("batch", "")
-        expected_raw = request.form.get("version", "").strip()
-        try:
-            expected_version = int(expected_raw) if expected_raw else None
-        except ValueError:
-            flash("页面版本号无效，请刷新后重试", "error")
-            return redirect(url_for("project_detail", name=name))
-        try:
-            batch = service.parse_sheet_lines(
-                batch_text, max_entries=service.MAX_BATCH, context="本批更正"
-            )
-            plan = service.build_plan(
-                project,
-                sheets,
-                issues,
-                batch,
-                expected_version=expected_version,
-            )
-        except service.ValidationError as exc:
-            for reason in exc.reasons:
-                flash(reason, "error")
-            return redirect(url_for("project_detail", name=name))
-
-        if action == "apply":
-            if plan.status == "stale":
-                for reason in plan.reasons:
-                    flash(reason, "error")
-            elif not plan.accepted:
-                db.log_rejection(
-                    name,
-                    plan.expected_version if plan.expected_version is not None else project.version,
-                    plan,
+        reference = (request.args.get("reference") or "").strip()
+        target = (request.args.get("target") or "").strip()
+        result = None
+        if reference or target:
+            try:
+                reference, target = service.parse_reference_pair(
+                    {"reference": reference, "target": target}, snapshot.sheet_map
                 )
-                for reason in plan.reasons:
-                    flash(f"退回：{reason}", "error")
-            else:
-                try:
-                    ok, message = service.commit_plan(db, name, plan)
-                except StorageError as exc:
-                    flash(f"写入失败，已保留原状：{exc}", "error")
-                else:
-                    if ok:
-                        flash(
-                            "更正已写入：消除缺片 "
-                            f"{plan.eliminated.missing_area} m²、重叠 {plan.eliminated.overlap_area} m²",
-                            "ok",
-                        )
-                    else:
-                        flash(message, "error")
-            return redirect(url_for("project_detail", name=name))
+                result = service.compute_verification(snapshot, reference, target)
+            except ValidationError as exc:
+                for reason in exc.reasons:
+                    flash(reason, "error")
+        return _render_project(snapshot, reference=reference, target=target, result=result)
 
-        label = "通过" if plan.accepted else ("已过期" if plan.status == "stale" else "退回")
-        for reason in plan.reasons:
-            flash(f"预检{label}：{reason}", "ok" if plan.accepted else "error")
-        flash(
-            "受影响重算范围：" + ("；".join(str(r) for r in plan.window) or "无"),
-            "info",
-        )
+    # ---------------------------------------------------------- measurements
+
+    def _add_measurement_or_error(name: str, form: dict) -> tuple[bool, list[str]]:
+        snapshot = _load(name)
+        if snapshot is None:
+            return False, ["项目不存在"]
+        try:
+            measurement = service.parse_measurement_form(form, snapshot.sheet_map)
+            service.add_measurement(db, name, measurement)
+        except ValidationError as exc:
+            return False, exc.reasons
+        except StorageError as exc:
+            return False, [str(exc)]
+        return True, []
+
+    @app.post("/projects/<name>/measurements")
+    def add_measurement_form(name: str):
+        ok, reasons = _add_measurement_or_error(name, request.form.to_dict())
+        if ok:
+            flash("测量已保存（原坐标留存，核查时按现行图幅重判有效性）", "ok")
+        else:
+            for reason in reasons:
+                flash(reason, "error")
         return redirect(url_for("project_detail", name=name))
+
+    # ---------------------------------------------------------------- APIs
+
+    @app.post("/api/projects/<name>/verify")
+    def api_verify(name: str):
+        snapshot = _load(name)
+        if snapshot is None:
+            return jsonify({"error": "项目不存在"}), 404
+        payload = request.get_json(silent=True) or {}
+        try:
+            reference, target = service.parse_reference_pair(payload, snapshot.sheet_map)
+        except ValidationError as exc:
+            return _json_error(exc.reasons)
+        result = service.compute_verification(snapshot, reference, target)
+        return jsonify({"verification": _verification_dict(result)})
+
+    @app.post("/api/projects/<name>/measurements")
+    def api_add_measurement(name: str):
+        snapshot = _load(name)
+        if snapshot is None:
+            return jsonify({"error": "项目不存在"}), 404
+        payload = request.get_json(silent=True) or {}
+        ok, reasons = _add_measurement_or_error(name, payload)
+        if not ok:
+            return _json_error(reasons)
+        return jsonify({"added": True}), 201
 
     @app.get("/api/projects/<name>/state")
     def api_state(name: str):
-        state = _load(name)
-        if state is None:
+        snapshot = _load(name)
+        if snapshot is None:
             return jsonify({"error": "项目不存在"}), 404
-        project, sheets, issues = state
-        return jsonify(
-            {
-                "project": {
-                    "name": project.name,
-                    "version": project.version,
-                    "extent": list(project.extent.as_tuple()),
-                },
-                "sheets": [
-                    {"no": s.no, "rect": list(s.rect.as_tuple())} for s in sheets
-                ],
-                "issues": [_issue_dict(i, project.extent) for i in issues],
-                "stats": _stats_dict(Stats.from_issues(issues)),
-            }
-        )
+        data = _snapshot_dict(snapshot)
+        data["validity"] = [
+            _validity_dict(service.measurement_validity(item, snapshot.sheet_map))
+            for item in snapshot.measurements
+        ]
+        return jsonify(data)
+
+    @app.post("/api/projects/<name>/correct")
+    def api_correct(name: str):
+        snapshot = _load(name)
+        if snapshot is None:
+            return jsonify({"error": "项目不存在"}), 404
+        payload = request.get_json(silent=True) or {}
+        try:
+            expected_version = int(payload.get("version"))
+        except (TypeError, ValueError):
+            return _json_error(["version 必须是整数"])
+        try:
+            entries = _parse_correction(payload)
+        except ValidationError as exc:
+            return _json_error(exc.reasons)
+        try:
+            ok, message = service.apply_correction(db, name, entries, expected_version)
+        except ValidationError as exc:
+            return _json_error(exc.reasons)
+        except StorageError as exc:
+            return jsonify({"applied": False, "message": str(exc)}), 500
+        if not ok:
+            return jsonify({"applied": False, "message": message}), 409
+        return jsonify({"applied": True, "message": message}), 200
+
+    @app.post("/projects/<name>/correct")
+    def correct_form(name: str):
+        snapshot = _load(name)
+        if snapshot is None:
+            abort(404)
+        reference = (request.form.get("reference") or "").strip()
+        target = (request.form.get("target") or "").strip()
+        back = url_for("project_detail", name=name)
+        if reference and target:
+            back = url_for("project_detail", name=name, reference=reference, target=target)
+        try:
+            entries = service.parse_sheet_lines(
+                request.form.get("sheets", ""),
+                max_entries=service.MAX_CORRECTION_SHEETS,
+                context="本批更正",
+            )
+            expected_version = int((request.form.get("version") or "").strip())
+        except ValidationError as exc:
+            for reason in exc.reasons:
+                flash(reason, "error")
+            return redirect(back)
+        except ValueError:
+            flash("页面版本号无效，请刷新后重试", "error")
+            return redirect(back)
+        try:
+            ok, message = service.apply_correction(db, name, entries, expected_version)
+        except ValidationError as exc:
+            for reason in exc.reasons:
+                flash(reason, "error")
+        except StorageError as exc:
+            flash(f"写入失败，已保留原状：{exc}", "error")
+        else:
+            flash(message, "ok" if ok else "error")
+        return redirect(back)
 
     @app.get("/healthz")
     def healthz():
         return jsonify({"ok": True})
 
     return app
+
+
+def _parse_correction(payload: dict) -> list[tuple[str, Rect]]:
+    """接受 JSON 的 {"sheets": [[图幅号, x0, y0, x1, y1], ...]} 或文本行。"""
+
+    if "sheets" in payload and isinstance(payload["sheets"], list):
+        entries: list[tuple[str, Rect]] = []
+        seen: set[str] = set()
+        reasons: list[str] = []
+        for index, item in enumerate(payload["sheets"], start=1):
+            try:
+                no, x0, y0, x1, y1 = item
+                no = str(no)
+                if not service.SHEET_NO_RE.match(no):
+                    raise ValueError("图幅号非法")
+                rect = Rect(int(x0), int(y0), int(x1), int(y1))
+            except (TypeError, ValueError):
+                reasons.append(f"第 {index} 项应为 [图幅号, x0, y0, x1, y1] 且坐标为整数")
+                continue
+            if no in seen:
+                reasons.append(f"图幅号重复: {no}")
+                continue
+            seen.add(no)
+            entries.append((no, rect))
+        if reasons:
+            raise ValidationError(reasons)
+        return entries
+    text = str(payload.get("batch") or "")
+    return service.parse_sheet_lines(
+        text, max_entries=service.MAX_CORRECTION_SHEETS, context="本批更正"
+    )

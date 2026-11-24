@@ -3,13 +3,13 @@
 <head>
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1">
-  <title>{% block title %}接幅核查{% endblock %}</title>
+  <title>{% block title %}图幅配准核查{% endblock %}</title>
   <link rel="stylesheet" href="{{ url_for('static', filename='style.css') }}">
 </head>
 <body>
   <header class="topbar">
-    <a class="brand" href="{{ url_for('index') }}">接幅核查</a>
-    <span class="muted">相邻图幅交库前核查 / 批量更正</span>
+    <a class="brand" href="{{ url_for('index') }}">图幅配准核查</a>
+    <span class="muted">正射图幅平移量 · 两条独立测量路径复核</span>
   </header>
   <main>
     {% with messages = get_flashed_messages(with_categories=true) %}
@@ -23,6 +23,5 @@
     {% endwith %}
     {% block content %}{% endblock %}
   </main>
-  <script src="{{ url_for('static', filename='app.js') }}"></script>
 </body>
 </html>

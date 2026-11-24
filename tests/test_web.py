@@ -2,8 +2,8 @@ from __future__ import annotations
 
 import pytest
 
+from adjcheck import service
 from adjcheck.app import create_app
-from adjcheck.db import Database
 
 
 @pytest.fixture()
@@ -14,33 +14,14 @@ def client(tmp_path):
         yield test_client, app
 
 
-DEMO_BATCH = [
-    {"no": "S3", "x0": 1000, "y0": 0, "x1": 1100, "y1": 500},
-    {"no": "S5", "x0": 1000, "y0": 500, "x1": 1100, "y1": 1000},
-]
-
-
-def test_index_lists_demo_project(client):
+def test_index_lists_demo_projects(client):
     c, _ = client
     resp = c.get("/")
-    assert resp.status_code == 200
-    body = resp.data.decode()
-    assert "DEMO-ADJ-001" in body
-    assert "接幅核查" in body
-
-
-def test_detail_shows_missing_and_overlap_with_all_sheet_numbers(client):
-    c, _ = client
-    resp = c.get("/projects/DEMO-ADJ-001")
     body = resp.data.decode()
     assert resp.status_code == 200
-    assert "缺片区（1）" in body
-    assert "重叠区（2）" in body
-    # every sheet number participating in the overlap is rendered
-    for token in ["S1", "S2", "S3"]:
-        assert token in body
-    assert "1000 500 1100 1000" in body  # missing rectangle
-    assert "1100 0 1400 500" in body  # overlap rectangle
+    assert "图幅配准核查" in body
+    for name in (service.DEMO_NAME, service.DISCONNECTED_NAME, service.CONFLICT_NAME):
+        assert name in body
 
 
 def test_healthz(client):
@@ -48,185 +29,291 @@ def test_healthz(client):
     assert c.get("/healthz").get_json() == {"ok": True}
 
 
-def test_create_project_validation_errors(client):
+def test_detail_with_verified_pair_shows_translation_and_both_paths(client):
+    c, _ = client
+    resp = c.get(f"/projects/{service.DEMO_NAME}?reference=A&target=C")
+    body = resp.data.decode()
+    assert resp.status_code == 200
+    assert "已核实" in body
+    assert "x = 3 m" in body and "y = -2 m" in body
+    assert "M1 → M2" in body
+    assert "M3" in body
+
+
+def test_detail_shows_disconnected(client):
+    c, _ = client
+    body = c.get(f"/projects/{service.DISCONNECTED_NAME}?reference=P&target=R").data.decode()
+    assert "失联" in body
+
+
+def test_detail_shows_contradiction(client):
+    c, _ = client
+    body = c.get(f"/projects/{service.CONFLICT_NAME}?reference=X&target=Y").data.decode()
+    assert "测量矛盾" in body
+    assert "K2" in body
+
+
+def test_verification_api(client):
+    c, _ = client
+    resp = c.post(
+        f"/api/projects/{service.DEMO_NAME}/verify", json={"reference": "A", "target": "C"}
+    )
+    data = resp.get_json()["verification"]
+    assert resp.status_code == 200
+    assert data["status"] == "verified"
+    assert data["translation"] == [3, -2]
+    assert [path["measurements"] for path in data["paths"]] == [["M1", "M2"], ["M3"]]
+
+
+def test_verification_api_rejects_same_sheet(client):
+    c, _ = client
+    resp = c.post(
+        f"/api/projects/{service.DEMO_NAME}/verify", json={"reference": "A", "target": "A"}
+    )
+    assert resp.status_code == 400
+    assert "必须不同" in resp.get_json()["error"]
+
+
+def test_configuration_requires_measurements_before_verifying(client):
+    c, _ = client
+    app = c.application
+    db = app.extensions["adjcheck_db"]
+    project = db.get_project(service.DEMO_NAME)
+    service.apply_correction(
+        db,
+        service.DEMO_NAME,
+        [("C", __import__("adjcheck.geometry", fromlist=["Rect"]).Rect(0, 0, 57, 100))],
+        project.version,
+    )
+    resp = c.post(
+        f"/api/projects/{service.DEMO_NAME}/verify", json={"reference": "A", "target": "C"}
+    )
+    data = resp.get_json()["verification"]
+    assert data["status"] == "insufficient"
+    assert [item["no"] for item in data["invalid"]] == ["M3"]
+    # the original coordinate is still displayed on the page, marked as not used
+    body = c.get(f"/projects/{service.DEMO_NAME}").data.decode()
+    assert "57, 62" in body
+    assert "不参与" in body
+
+
+def test_add_measurement_form_and_api(client):
     c, app = client
+    db = app.extensions["adjcheck_db"]
+    before = len(db.get_snapshot(service.DEMO_NAME).measurements)
+    form = {
+        "no": "M9",
+        "sheet_a": "A",
+        "ax": "5",
+        "ay": "5",
+        "sheet_b": "B",
+        "bx": "7",
+        "by": "4",
+    }
+    resp = c.post(f"/projects/{service.DEMO_NAME}/measurements", data=form, follow_redirects=True)
+    assert "测量已保存" in resp.data.decode()
+    assert len(db.get_snapshot(service.DEMO_NAME).measurements) == before + 1
+
+
+def test_add_measurement_rejects_unknown_sheet_and_duplicate(client):
+    c, _ = client
+    resp = c.post(
+        f"/api/projects/{service.DEMO_NAME}/measurements",
+        json={"no": "M1", "sheet_a": "A", "ax": 1, "ay": 1, "sheet_b": "B", "bx": 1, "by": 1},
+    )
+    assert resp.status_code == 400
+    assert "测量号重复" in resp.get_json()["error"]
+    resp = c.post(
+        f"/api/projects/{service.DEMO_NAME}/measurements",
+        json={"no": "M2", "sheet_a": "Z", "ax": 1, "ay": 1, "sheet_b": "B", "bx": 1, "by": 1},
+    )
+    assert resp.status_code == 400
+    assert "不在现行目录" in resp.get_json()["error"]
+
+
+def test_correction_flow_shows_before_and_after(client):
+    c, app = client
+    db = app.extensions["adjcheck_db"]
+    project = db.get_project(service.DEMO_NAME)
+    resp = c.post(
+        f"/api/projects/{service.DEMO_NAME}/correct",
+        json={"version": project.version, "sheets": [["C", 0, 0, 57, 100]]},
+    )
+    assert resp.status_code == 200
+    assert resp.get_json()["applied"] is True
+    data = c.post(
+        f"/api/projects/{service.DEMO_NAME}/verify", json={"reference": "A", "target": "C"}
+    ).get_json()["verification"]
+    assert data["status"] == "insufficient"
+    assert data["invalid"][0]["no"] == "M3"
+    # measurements are kept verbatim
+    state = c.get(f"/api/projects/{service.DEMO_NAME}/state").get_json()
+    m3 = next(m for m in state["measurements"] if m["no"] == "M3")
+    assert m3["point_b"] == [57, 62]
+
+
+def test_correction_to_58_keeps_measurement_valid(client):
+    c, app = client
+    db = app.extensions["adjcheck_db"]
+    project = db.get_project(service.DEMO_NAME)
+    resp = c.post(
+        f"/api/projects/{service.DEMO_NAME}/correct",
+        json={"version": project.version, "sheets": [["C", 0, 0, 58, 100]]},
+    )
+    assert resp.status_code == 200
+    data = c.post(
+        f"/api/projects/{service.DEMO_NAME}/verify", json={"reference": "A", "target": "C"}
+    ).get_json()["verification"]
+    # x=57 < 58, so M3 stays valid and both paths remain
+    assert data["status"] == "verified"
+    assert data["invalid"] == []
+    assert data["translation"] == [3, -2]
+
+
+def test_stale_correction_returns_409_and_keeps_state(client):
+    c, app = client
+    db = app.extensions["adjcheck_db"]
+    project = db.get_project(service.DEMO_NAME)
+    ok, _ = service.apply_correction(
+        db, service.DEMO_NAME, [("C", __import__("adjcheck.geometry", fromlist=["Rect"]).Rect(0, 0, 90, 100))], project.version
+    )
+    assert ok
+    resp = c.post(
+        f"/api/projects/{service.DEMO_NAME}/correct",
+        json={"version": project.version, "sheets": [["C", 0, 0, 57, 100]]},
+    )
+    assert resp.status_code == 409
+    assert "已过期" in resp.get_json()["message"]
+    assert db.get_project(service.DEMO_NAME).version == project.version + 1
+
+
+def test_correction_form_fallback(client):
+    c, app = client
+    db = app.extensions["adjcheck_db"]
+    project = db.get_project(service.DEMO_NAME)
+    resp = c.post(
+        f"/projects/{service.DEMO_NAME}/correct",
+        data={"version": str(project.version), "sheets": "C 0 0 57 100"},
+        follow_redirects=True,
+    )
+    assert "更正已提交" in resp.data.decode()
+    snapshot = db.get_snapshot(service.DEMO_NAME)
+    assert snapshot.project.version == project.version + 1
+    assert snapshot.sheet_map["C"].rect.x1 == 57
+    assert len(snapshot.measurements) == len(service.DEMO_MEASUREMENTS)
+
+
+def test_create_project_and_validation(client):
+    c, app = client
+    db = app.extensions["adjcheck_db"]
     resp = c.post(
         "/projects",
-        data={"name": "BAD", "x0": "0", "y0": "0", "x1": "0", "y1": "10", "sheets": "A 0 0 1 1"},
+        data={"name": "NEW-1", "feature": "井盖", "sheets": "A 0 0 10 10\nB 10 0 20 10"},
+        follow_redirects=True,
+    )
+    assert "已创建" in resp.data.decode()
+    assert db.get_project("NEW-1") is not None
+    resp = c.post(
+        "/projects",
+        data={"name": "BAD", "feature": "井盖", "sheets": "A 0 0 0 10"},
         follow_redirects=True,
     )
     assert "必须满足 x0&lt;x1" in resp.data.decode()
-    resp = c.post(
-        "/projects",
-        data={"name": "BAD", "x0": "0", "y0": "0", "x1": "10", "y1": "10", "sheets": "A 0 0 1"},
-        follow_redirects=True,
-    )
-    assert "格式应为" in resp.data.decode()
-    db: Database = app.extensions["adjcheck_db"]
-    assert db.get_project("BAD") is None
 
 
-def test_create_project_success_and_limit(client):
+def test_correction_cannot_exceed_500_sheets(client):
     c, app = client
-    sheets = "\n".join(f"S{i} {i * 10} 0 {i * 10 + 9} 10" for i in range(3))
-    resp = c.post(
-        "/projects",
-        data={"name": "P1", "x0": "0", "y0": "0", "x1": "100", "y1": "10", "sheets": sheets},
-        follow_redirects=True,
+    db = app.extensions["adjcheck_db"]
+    sheets = [f"S{index}" for index in range(499)]
+    assert service.create_project(
+        db, "BIG", "树", [(no, __import__("adjcheck.geometry", fromlist=["Rect"]).Rect(0, 0, 1, 1)) for no in sheets]
     )
-    body = resp.data.decode()
-    assert "已创建" in body
-    assert "缺片区（3）" in body  # gaps between the three sheets, plus trailing extent
-    db: Database = app.extensions["adjcheck_db"]
-    project, stored = db.get_sheets("P1")
-    assert len(stored) == 3
-
-    too_many = "\n".join(f"S{i} {i} 0 {i + 1} 1" for i in range(101))
+    project = db.get_project("BIG")
     resp = c.post(
-        "/projects",
-        data={"name": "P2", "x0": "0", "y0": "0", "x1": "200", "y1": "10", "sheets": too_many},
-        follow_redirects=True,
-    )
-    assert "最多 100 张图幅" in resp.data.decode()
-    assert db.get_project("P2") is None
-
-
-def test_api_check_rejects_bad_batch(client):
-    c, _ = client
-    resp = c.post("/api/projects/DEMO-ADJ-001/check", json={"batch": [], "version": 0})
-    assert resp.status_code == 400
-    resp = c.post(
-        "/api/projects/DEMO-ADJ-001/check",
-        json={"batch": DEMO_BATCH * 3, "version": 0},
+        "/api/projects/BIG/correct",
+        json={"version": project.version, "sheets": [["X1", 0, 0, 1, 1], ["X2", 0, 0, 1, 1]]},
     )
     assert resp.status_code == 400
-    assert "最多更正 4 张" in resp.get_json()["error"]
-
-
-def test_api_check_then_apply_then_state(client):
-    c, _ = client
-    plan = c.post("/api/projects/DEMO-ADJ-001/check", json={"batch": DEMO_BATCH, "version": 0})
-    body = plan.get_json()
-    assert plan.status_code == 200
-    assert body["accepted"] is True
-    assert body["eliminated"]["missing_area"] == 50000
-    assert body["eliminated"]["overlap_area"] == 200000
-
-    applied = c.post("/api/projects/DEMO-ADJ-001/apply", json={"batch": DEMO_BATCH, "version": 0})
-    payload = applied.get_json()
-    assert applied.status_code == 200 and payload["applied"] is True
-
-    state = c.get("/api/projects/DEMO-ADJ-001/state").get_json()
-    assert state["project"]["version"] == 1
-    assert state["stats"]["missing_count"] == 0
-    assert state["stats"]["overlap_count"] == 0
-    assert [s["no"] for s in state["sheets"]] == ["S1", "S2", "S3", "S5"]
-
-    page = c.get("/projects/DEMO-ADJ-001")
-    assert "更正已提交" not in page.data.decode()  # flash was on the previous request
-    assert "更正记录" in page.data.decode()
-
-
-def test_api_apply_rejected_keeps_state_and_logs(client):
-    c, _ = client
-    bad = [{"no": "S3", "x0": 1050, "y0": 0, "x1": 1150, "y1": 500}]
-    resp = c.post("/api/projects/DEMO-ADJ-001/apply", json={"batch": bad, "version": 0})
-    payload = resp.get_json()
+    assert "超过 500" in resp.get_json()["error"]
+    # adding one sheet is still fine
+    resp = c.post(
+        "/api/projects/BIG/correct",
+        json={"version": project.version, "sheets": [["X1", 0, 0, 1, 1]]},
+    )
     assert resp.status_code == 200
-    assert payload["applied"] is False
-    assert "退回" in payload["message"]
-    assert payload["plan"]["new_problems"]["missing_area"] > 0
-    state = c.get("/api/projects/DEMO-ADJ-001/state").get_json()
-    assert state["project"]["version"] == 0
-    assert state["stats"]["missing_count"] == 1 and state["stats"]["overlap_count"] == 2
-    assert [s["no"] for s in state["sheets"]] == ["S1", "S2", "S3"]
 
 
-def test_api_apply_stale_version_conflict(client):
-    c, _ = client
-    assert c.post(
-        "/api/projects/DEMO-ADJ-001/apply", json={"batch": DEMO_BATCH, "version": 0}
-    ).get_json()["applied"]
-    resp = c.post("/api/projects/DEMO-ADJ-001/apply", json={"batch": DEMO_BATCH, "version": 0})
-    assert resp.status_code == 409
-    body = resp.get_json()
-    assert body["applied"] is False
-    assert "过期" in body["message"]
-    state = c.get("/api/projects/DEMO-ADJ-001/state").get_json()
-    assert state["project"]["version"] == 1
-
-
-def test_form_fallback_check_and_apply(client):
-    c, _ = client
-    text = "S3 1000 0 1100 500\nS5 1000 500 1100 1000\n"
-    pre = c.post(
-        "/projects/DEMO-ADJ-001/correct",
-        data={"action": "check", "version": "0", "batch": text},
-        follow_redirects=True,
-    )
-    assert "预检通过" in pre.data.decode()
-    applied = c.post(
-        "/projects/DEMO-ADJ-001/correct",
-        data={"action": "apply", "version": "0", "batch": text},
-        follow_redirects=True,
-    )
-    assert "更正已写入" in applied.data.decode()
-    state = c.get("/api/projects/DEMO-ADJ-001/state").get_json()
-    assert state["project"]["version"] == 1 and state["stats"]["problem_area"] == 0
-
-
-def test_form_fallback_rejects_invalid_version(client):
-    c, _ = client
-    resp = c.post(
-        "/projects/DEMO-ADJ-001/correct",
-        data={"action": "check", "version": "abc", "batch": "S3 1000 0 1100 500"},
-        follow_redirects=True,
-    )
-    assert "版本号无效" in resp.data.decode()
-
-
-def test_404_for_unknown_project(client):
-    c, _ = client
-    assert c.get("/projects/NOPE").status_code == 404
-    assert c.get("/api/projects/NOPE/state").status_code == 404
-    assert c.post("/api/projects/NOPE/check", json={"batch": DEMO_BATCH}).status_code == 404
-
-
-def test_write_failure_reports_and_keeps_state(client):
+def test_measurement_limit_is_120_via_api(client):
     c, app = client
-    db: Database = app.extensions["adjcheck_db"]
-    with db.connection() as conn:
-        conn.executescript(
-            """
-            CREATE TRIGGER fail_sheet_insert BEFORE INSERT ON sheets
-            BEGIN SELECT RAISE(ABORT, 'simulated disk failure'); END;
-            """
+    db = app.extensions["adjcheck_db"]
+    existing = len(db.get_snapshot(service.DEMO_NAME).measurements)
+    for index in range(existing, 120):
+        resp = c.post(
+            f"/api/projects/{service.DEMO_NAME}/measurements",
+            json={
+                "no": f"BULK{index}",
+                "sheet_a": "A",
+                "ax": 1,
+                "ay": 1,
+                "sheet_b": "B",
+                "bx": 2,
+                "by": 2,
+            },
         )
-    resp = c.post("/api/projects/DEMO-ADJ-001/apply", json={"batch": DEMO_BATCH, "version": 0})
-    assert resp.status_code == 500
-    body = resp.get_json()
-    assert body["applied"] is False
-    assert "写入失败" in body["message"]
-    state = c.get("/api/projects/DEMO-ADJ-001/state").get_json()
-    assert state["project"]["version"] == 0
-    assert state["stats"] == {
-        "missing_count": 1,
-        "missing_area": 50000,
-        "overlap_count": 2,
-        "overlap_area": 200000,
-        "problem_area": 250000,
-    }
+        assert resp.status_code == 201, resp.get_json()
+    resp = c.post(
+        f"/api/projects/{service.DEMO_NAME}/measurements",
+        json={"no": "OVER", "sheet_a": "A", "ax": 1, "ay": 1, "sheet_b": "B", "bx": 2, "by": 2},
+    )
+    assert resp.status_code == 400
+    assert "最多保存 120 条测量" in resp.get_json()["error"]
 
 
-def test_state_persists_across_app_restart(tmp_path):
-    path = str(tmp_path / "persist.sqlite3")
-    app1 = create_app(database_path=path)
-    with app1.test_client() as c1:
-        assert c1.post(
-            "/api/projects/DEMO-ADJ-001/apply", json={"batch": DEMO_BATCH, "version": 0}
-        ).get_json()["applied"]
-    app2 = create_app(database_path=path)
-    with app2.test_client() as c2:
-        state = c2.get("/api/projects/DEMO-ADJ-001/state").get_json()
-        assert state["project"]["version"] == 1
-        assert state["stats"]["problem_area"] == 0
+def test_persistence_across_app_restart(tmp_path):
+    path = str(tmp_path / "restart.sqlite3")
+    first = create_app(database_path=path)
+    with first.test_client() as c:
+        project = first.extensions["adjcheck_db"].get_project(service.DEMO_NAME)
+        c.post(
+            f"/api/projects/{service.DEMO_NAME}/correct",
+            json={"version": project.version, "sheets": [["C", 0, 0, 57, 100]]},
+        )
+    second = create_app(database_path=path)
+    with second.test_client() as c:
+        data = c.post(
+            f"/api/projects/{service.DEMO_NAME}/verify", json={"reference": "A", "target": "C"}
+        ).get_json()["verification"]
+        assert data["status"] == "insufficient"
+        assert data["version"] == 1
+
+
+def test_verification_uses_one_snapshot_even_if_catalog_changes(client, monkeypatch):
+    """A single verification request must use the submitted catalog and measurements."""
+
+    c, app = client
+    db = app.extensions["adjcheck_db"]
+    original = service.compute_verification
+    captured = {}
+
+    def wrapped(snapshot, reference, target):
+        captured["snapshot"] = snapshot
+        # simulate a concurrent correction between the read and the computation
+        service.apply_correction(
+            db,
+            service.DEMO_NAME,
+            [("C", __import__("adjcheck.geometry", fromlist=["Rect"]).Rect(0, 0, 57, 100))],
+            snapshot.project.version,
+        )
+        return original(snapshot, reference, target)
+
+    monkeypatch.setattr(service, "compute_verification", wrapped)
+    resp = c.post(
+        f"/api/projects/{service.DEMO_NAME}/verify", json={"reference": "A", "target": "C"}
+    )
+    assert resp.get_json()["verification"]["status"] == "verified"
+    # the next request sees the corrected catalog
+    monkeypatch.setattr(service, "compute_verification", original)
+    resp = c.post(
+        f"/api/projects/{service.DEMO_NAME}/verify", json={"reference": "A", "target": "C"}
+    )
+    assert resp.get_json()["verification"]["status"] == "insufficient"
