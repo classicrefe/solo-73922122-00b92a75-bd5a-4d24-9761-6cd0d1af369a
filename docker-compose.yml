@@ -1,0 +1,15 @@
+services:
+  adjcheck:
+    build: .
+    image: adjcheck:local
+    ports:
+      - "${ADJCHECK_PORT:-8000}:8000"
+    environment:
+      ADJCHECK_DB: /data/adjcheck.sqlite3
+      ADJCHECK_SECRET: "${ADJCHECK_SECRET:-change-me-in-production}"
+    volumes:
+      - adjdata:/data
+    restart: unless-stopped
+
+volumes:
+  adjdata:

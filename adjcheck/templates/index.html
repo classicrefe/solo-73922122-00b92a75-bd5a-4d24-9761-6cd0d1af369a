@@ -1,0 +1,62 @@
+{% extends "base.html" %}
+{% block title %}接幅核查 · 项目目录{% endblock %}
+{% block content %}
+<h1>接幅核查</h1>
+<p class="lead">
+  录入应交范围以及最多 100 张图幅的编号与覆盖范围（同一坐标系，整数米矩形）。
+  页面列出应交范围内有面积的缺片区与重叠区，重叠区标明全部相关图幅号。
+  一次可更正最多 4 张图幅，按整批替换后的覆盖判定。
+</p>
+
+<section class="card">
+  <h2>新建核查项目</h2>
+  <form method="post" action="{{ url_for('create') }}" class="grid-form">
+    <label>项目名 <input name="name" required maxlength="60" placeholder="例如 DEMO-ADJ-001"></label>
+    <fieldset>
+      <legend>应交范围（米）</legend>
+      <div class="inline">
+        <label>x0 <input name="x0" required inputmode="numeric" placeholder="0"></label>
+        <label>y0 <input name="y0" required inputmode="numeric" placeholder="0"></label>
+        <label>x1 <input name="x1" required inputmode="numeric" placeholder="2000"></label>
+        <label>y1 <input name="y1" required inputmode="numeric" placeholder="1000"></label>
+      </div>
+    </fieldset>
+    <label>图幅清单（每行：图幅号 x0 y0 x1 y1，最多 100 行）
+      <textarea name="sheets" rows="7" required spellcheck="false"
+        placeholder="S1 0 0 1000 1000&#10;S2 1100 0 2000 1000&#10;S3 900 0 1400 500"></textarea>
+    </label>
+    <button type="submit">创建并核查</button>
+  </form>
+</section>
+
+<section class="card">
+  <h2>项目目录</h2>
+  {% if catalog %}
+  <table class="table">
+    <thead>
+      <tr><th>项目</th><th>应交范围</th><th>图幅数</th><th>问题区数</th><th>缺片+重叠面积 (m²)</th><th>版本</th><th></th></tr>
+    </thead>
+    <tbody>
+      {% for item in catalog %}
+      <tr>
+        <td><a href="{{ url_for('project_detail', name=item.project.name) }}">{{ item.project.name }}</a></td>
+        <td class="mono">{{ item.project.extent.x0 }} {{ item.project.extent.y0 }} {{ item.project.extent.x1 }} {{ item.project.extent.y1 }}</td>
+        <td>{{ item.sheet_count }}</td>
+        <td>{{ item.issue_count }}</td>
+        <td>{{ item.problem_area }}</td>
+        <td>v{{ item.project.version }}</td>
+        <td>
+          <form method="post" action="{{ url_for('delete', name=item.project.name) }}"
+                onsubmit="return confirm('删除项目 {{ item.project.name }}？');">
+            <button class="danger" type="submit">删除</button>
+          </form>
+        </td>
+      </tr>
+      {% endfor %}
+    </tbody>
+  </table>
+  {% else %}
+  <p class="muted">暂无项目。创建一个，或等待示例项目初始化。</p>
+  {% endif %}
+</section>
+{% endblock %}

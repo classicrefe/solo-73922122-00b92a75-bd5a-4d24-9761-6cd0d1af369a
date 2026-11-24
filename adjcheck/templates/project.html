@@ -1,0 +1,127 @@
+{% extends "base.html" %}
+{% block title %}接幅核查 · {{ project.name }}{% endblock %}
+{% block content %}
+<h1>{{ project.name }} <span class="muted small">v{{ project.version }}</span></h1>
+<p class="mono muted">应交范围：{{ project.extent.x0 }} {{ project.extent.y0 }} {{ project.extent.x1 }} {{ project.extent.y1 }} m
+  · 图幅 {{ sheets|length }} 张 · 更新于 {{ project.updated_at }}</p>
+
+<section class="stats">
+  <div class="stat missing"><span class="n">{{ stats.missing_count }}</span><span class="l">缺片区</span><span class="a">{{ stats.missing_area }} m²</span></div>
+  <div class="stat overlap"><span class="n">{{ stats.overlap_count }}</span><span class="l">重叠区</span><span class="a">{{ stats.overlap_area }} m²</span></div>
+  <div class="stat ok"><span class="n">{{ stats.problem_area }}</span><span class="l">问题总面积</span><span class="a">m²</span></div>
+</section>
+
+<section class="card">
+  <h2>覆盖示意</h2>
+  <svg viewBox="0 0 {{ svg.width }} {{ svg.height }}" class="map" preserveAspectRatio="xMidYMid meet"
+       role="img" aria-label="图幅覆盖与问题区示意">
+    <rect x="0" y="0" width="{{ svg.width }}" height="{{ svg.height }}" class="extent"></rect>
+    {% for box in sheet_boxes %}
+      <rect x="{{ box.svg.x }}" y="{{ box.svg.y }}" width="{{ box.svg.width }}" height="{{ box.svg.height }}"
+            class="sheet" data-no="{{ box.no }}"></rect>
+    {% endfor %}
+    {% for box in issue_boxes %}
+      <rect x="{{ box.svg.x }}" y="{{ box.svg.y }}" width="{{ box.svg.width }}" height="{{ box.svg.height }}"
+            class="issue {{ box.kind }}"></rect>
+    {% endfor %}
+    {% for box in sheet_boxes %}
+      <text x="{{ box.svg.x + 8 }}" y="{{ box.svg.y + 22 }}" class="sheet-label">{{ box.no }}</text>
+    {% endfor %}
+  </svg>
+  <p class="legend">
+    <span class="key sheet-key"></span> 图幅范围
+    <span class="key missing-key"></span> 缺片
+    <span class="key overlap-key"></span> 重叠
+  </p>
+</section>
+
+<section class="card">
+  <h2>缺片区（{{ missing|length }}）</h2>
+  {% if missing %}
+  <table class="table">
+    <thead><tr><th>#</th><th>范围 x0 y0 x1 y1</th><th>宽×高</th><th>面积 m²</th></tr></thead>
+    <tbody>
+      {% for issue in missing %}
+      <tr><td>{{ loop.index }}</td><td class="mono">{{ issue.rect.x0 }} {{ issue.rect.y0 }} {{ issue.rect.x1 }} {{ issue.rect.y1 }}</td>
+        <td>{{ issue.rect.width }}×{{ issue.rect.height }}</td><td>{{ issue.rect.area }}</td></tr>
+      {% endfor %}
+    </tbody>
+  </table>
+  {% else %}<p class="muted">无缺片。</p>{% endif %}
+</section>
+
+<section class="card">
+  <h2>重叠区（{{ overlap|length }}）</h2>
+  {% if overlap %}
+  <table class="table">
+    <thead><tr><th>#</th><th>范围 x0 y0 x1 y1</th><th>宽×高</th><th>面积 m²</th><th>涉及图幅</th></tr></thead>
+    <tbody>
+      {% for issue in overlap %}
+      <tr><td>{{ loop.index }}</td><td class="mono">{{ issue.rect.x0 }} {{ issue.rect.y0 }} {{ issue.rect.x1 }} {{ issue.rect.y1 }}</td>
+        <td>{{ issue.rect.width }}×{{ issue.rect.height }}</td><td>{{ issue.rect.area }}</td>
+        <td class="tags">{% for no in issue.sheet_ids %}<span class="tag">{{ no }}</span>{% endfor %}</td></tr>
+      {% endfor %}
+    </tbody>
+  </table>
+  {% else %}<p class="muted">无重叠。</p>{% endif %}
+</section>
+
+<section class="card">
+  <h2>批量更正（最多 4 张图幅）</h2>
+  <p class="muted">整批替换后重新判定。更正必须消除一部分旧缺片或旧重叠，且不得让缺片或重叠出现在新的位置；
+    只重算本批新旧范围覆盖到的地方。</p>
+  {% if demo_notes %}
+    <ul class="notes">{% for note in demo_notes %}<li>{{ note }}</li>{% endfor %}</ul>
+  {% endif %}
+  <form method="post" action="{{ url_for('correct_form', name=project.name) }}" class="grid-form"
+        data-correct-form
+        data-check-url="{{ url_for('api_check', name=project.name) }}"
+        data-apply-url="{{ url_for('api_apply', name=project.name) }}">
+    <input type="hidden" name="version" value="{{ project.version }}">
+    <label>本批图幅（每行：图幅号 x0 y0 x1 y1；图幅号已存在则为替换，否则为新增）
+      <textarea name="batch" rows="4" required spellcheck="false">{{ demo_batch }}</textarea>
+    </label>
+    <div class="actions">
+      <button type="submit" name="action" value="check" class="secondary">仅预检（不写入）</button>
+      <button type="submit" name="action" value="apply">提交更正</button>
+      {% if demo_reject %}
+        <button type="button" class="secondary" id="fill-reject">填入会退回的示例并预检</button>
+      {% endif %}
+    </div>
+  </form>
+  {% if demo_reject %}
+    <script>
+      document.getElementById("fill-reject")?.addEventListener("click", () => {
+        const textarea = document.querySelector("form[data-correct-form] textarea[name=batch]");
+        textarea.value = {{ demo_reject|tojson }};
+        document.querySelector("form[data-correct-form] button[value=check]").click();
+      });
+    </script>
+  {% endif %}
+  <div id="plan-panel" class="plan-panel" hidden>
+    <h3>判定结果</h3>
+    <div id="plan-output" class="plan-output"></div>
+  </div>
+</section>
+
+<section class="card">
+  <h2>更正记录</h2>
+  {% if log %}
+  <table class="table">
+    <thead><tr><th>#</th><th>时间</th><th>结果</th><th>本批</th><th>重算范围 (m²)</th><th>说明</th></tr></thead>
+    <tbody>
+      {% for entry in log %}
+      <tr>
+        <td>{{ entry.id }}</td>
+        <td class="mono small">{{ entry.created_at }}</td>
+        <td><span class="pill {{ entry.status }}">{{ entry.status }}</span></td>
+        <td class="mono small">{{ entry.batch|map(attribute='no')|join(', ') }}</td>
+        <td>{{ entry.window|sum(attribute='area') if entry.window else 0 }}</td>
+        <td class="small">{{ entry.reason }}</td>
+      </tr>
+      {% endfor %}
+    </tbody>
+  </table>
+  {% else %}<p class="muted">暂无更正记录。</p>{% endif %}
+</section>
+{% endblock %}
